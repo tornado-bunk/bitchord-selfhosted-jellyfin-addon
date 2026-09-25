@@ -115,3 +115,71 @@ func TestLoadLogFormat(t *testing.T) {
 		t.Fatalf("err = %v", err)
 	}
 }
+
+func validJellyfin() map[string]string {
+	return map[string]string{
+		"JELLYFIN_URL":     "http://jellyfin:8096/",
+		"JELLYFIN_API_KEY": "tok-123456",
+		"ADDON_SECRET":     "abcdefghijklmnop",
+		"PUBLIC_URL":       "https://music.example.com/",
+	}
+}
+
+func TestLoadJellyfinAppliesDefaultsAndTrimsSlashes(t *testing.T) {
+	cfg, err := Load(env(validJellyfin()))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Backend != BackendJellyfin {
+		t.Errorf("Backend = %v, want %v", cfg.Backend, BackendJellyfin)
+	}
+	if cfg.JellyfinURL != "http://jellyfin:8096" {
+		t.Errorf("JellyfinURL = %q", cfg.JellyfinURL)
+	}
+	if cfg.JellyfinAPIKey != "tok-123456" {
+		t.Errorf("JellyfinAPIKey = %q", cfg.JellyfinAPIKey)
+	}
+	if cfg.AddonName != "Jellyfin" {
+		t.Errorf("AddonName = %q, want Jellyfin", cfg.AddonName)
+	}
+	if cfg.Section != "" || cfg.JellyfinUser != "" || cfg.JellyfinUserID != "" {
+		t.Errorf("defaults wrong: %+v", cfg)
+	}
+}
+
+func TestLoadJellyfinReadsOptionalValues(t *testing.T) {
+	vars := validJellyfin()
+	vars["JELLYFIN_LIBRARY"] = "Music"
+	vars["JELLYFIN_USER"] = "alice"
+	vars["JELLYFIN_USER_ID"] = "user-123"
+	vars["ADDON_NAME"] = "Home Jellyfin"
+	cfg, err := Load(env(vars))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Section != "Music" || cfg.JellyfinUser != "alice" || cfg.JellyfinUserID != "user-123" || cfg.AddonName != "Home Jellyfin" {
+		t.Errorf("got %+v", cfg)
+	}
+}
+
+func TestLoadJellyfinReportsMissingVariables(t *testing.T) {
+	vars := map[string]string{
+		"JELLYFIN_URL": "http://jellyfin:8096",
+		"ADDON_SECRET": "abcdefghijklmnop",
+		"PUBLIC_URL":   "https://music.example.com",
+	}
+	_, err := Load(env(vars))
+	if err == nil || !strings.Contains(err.Error(), "JELLYFIN_API_KEY") {
+		t.Fatalf("expected missing JELLYFIN_API_KEY: %v", err)
+	}
+}
+
+func TestLoadRejectsBothPlexAndJellyfin(t *testing.T) {
+	vars := valid()
+	vars["JELLYFIN_URL"] = "http://jellyfin:8096"
+	vars["JELLYFIN_API_KEY"] = "tok"
+	_, err := Load(env(vars))
+	if err == nil || !strings.Contains(err.Error(), "cannot configure both") {
+		t.Fatalf("expected error about both configured: %v", err)
+	}
+}

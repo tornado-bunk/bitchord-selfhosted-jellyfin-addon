@@ -2,6 +2,7 @@ package library
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"sync/atomic"
 	"time"
@@ -15,8 +16,12 @@ type Source interface {
 	AllTracks(ctx context.Context, section string) ([]plex.Track, error)
 }
 
+type LibrarySource interface {
+	AllLibraryTracks(ctx context.Context, section string) ([]Track, error)
+}
+
 type Library struct {
-	source   Source
+	source   any
 	section  string
 	interval time.Duration
 	log      *slog.Logger
@@ -24,7 +29,7 @@ type Library struct {
 	sleep    func(context.Context, time.Duration) error
 }
 
-func NewLibrary(source Source, section string, interval time.Duration, log *slog.Logger) *Library {
+func NewLibrary(source any, section string, interval time.Duration, log *slog.Logger) *Library {
 	return &Library{source: source, section: section, interval: interval, log: log, sleep: sleep}
 }
 
@@ -50,15 +55,29 @@ func (l *Library) Get(id string) (Track, bool) {
 
 func (l *Library) Refresh(ctx context.Context) error {
 	started := time.Now()
-	raw, err := l.source.AllTracks(ctx, l.section)
-	if err != nil {
-		return err
-	}
-	tracks := make([]Track, 0, len(raw))
-	for _, item := range raw {
-		if track, ok := FromPlex(item); ok {
-			tracks = append(tracks, track)
+	var tracks []Track
+	var skipped int
+	switch s := l.source.(type) {
+	case LibrarySource:
+		var err error
+		tracks, err = s.AllLibraryTracks(ctx, l.section)
+		if err != nil {
+			return err
 		}
+	case Source:
+		raw, err := s.AllTracks(ctx, l.section)
+		if err != nil {
+			return err
+		}
+		tracks = make([]Track, 0, len(raw))
+		for _, item := range raw {
+			if track, ok := FromPlex(item); ok {
+				tracks = append(tracks, track)
+			}
+		}
+		skipped = len(raw) - len(tracks)
+	default:
+		return errors.New("unsupported library source")
 	}
 	next := NewIndex(tracks)
 	previous := l.index.Swap(next)
@@ -67,7 +86,7 @@ func (l *Library) Refresh(ctx context.Context) error {
 		removed = previous.missingFrom(next)
 	}
 	l.log.Info("library indexed", "tracks", len(tracks), "added", next.missingFrom(previous), "removed", removed,
-		"skipped", len(raw)-len(tracks), "took", time.Since(started).String())
+		"skipped", skipped, "took", time.Since(started).String())
 	return nil
 }
 

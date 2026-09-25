@@ -11,9 +11,21 @@ import (
 	"time"
 )
 
+type BackendType string
+
+const (
+	BackendPlex     BackendType = "plex"
+	BackendJellyfin BackendType = "jellyfin"
+)
+
 type Config struct {
+	Backend         BackendType
 	PlexURL         string
 	PlexToken       string
+	JellyfinURL     string
+	JellyfinAPIKey  string
+	JellyfinUser    string
+	JellyfinUserID  string
 	Secret          string
 	PublicURL       string
 	Section         string
@@ -52,19 +64,67 @@ func Load(getenv func(string) string) (Config, error) {
 		return value
 	}
 
+	plexURL := strings.TrimRight(strings.TrimSpace(getenv("PLEX_URL")), "/")
+	plexToken := strings.TrimSpace(getenv("PLEX_TOKEN"))
+	jellyfinURL := strings.TrimRight(strings.TrimSpace(getenv("JELLYFIN_URL")), "/")
+	jellyfinAPIKey := strings.TrimSpace(getenv("JELLYFIN_API_KEY"))
+
+	hasPlex := plexURL != "" || plexToken != ""
+	hasJellyfin := jellyfinURL != "" || jellyfinAPIKey != ""
+
+	var backend BackendType
+	defaultName := "Plex"
+	var section string
+
+	switch {
+	case hasPlex && hasJellyfin:
+		fail("cannot configure both Plex and Jellyfin, choose one")
+		backend = BackendPlex
+	case hasJellyfin:
+		backend = BackendJellyfin
+		defaultName = "Jellyfin"
+		if jellyfinURL == "" {
+			fail("JELLYFIN_URL is required")
+		}
+		if jellyfinAPIKey == "" {
+			fail("JELLYFIN_API_KEY is required")
+		}
+		section = get("JELLYFIN_LIBRARY", get("JELLYFIN_SECTION", ""))
+	default:
+		backend = BackendPlex
+		if plexURL == "" {
+			fail("PLEX_URL is required")
+		}
+		if plexToken == "" {
+			fail("PLEX_TOKEN is required")
+		}
+		section = get("PLEX_SECTION", "")
+	}
+
 	cfg := Config{
-		PlexURL:   strings.TrimRight(required("PLEX_URL"), "/"),
-		PlexToken: required("PLEX_TOKEN"),
-		Secret:    required("ADDON_SECRET"),
-		PublicURL: strings.TrimRight(required("PUBLIC_URL"), "/"),
-		Section:   get("PLEX_SECTION", ""),
-		AddonName: get("ADDON_NAME", "Plex"),
+		Backend:        backend,
+		PlexURL:        plexURL,
+		PlexToken:      plexToken,
+		JellyfinURL:    jellyfinURL,
+		JellyfinAPIKey: jellyfinAPIKey,
+		JellyfinUser:   get("JELLYFIN_USER", ""),
+		JellyfinUserID: get("JELLYFIN_USER_ID", ""),
+		Secret:         required("ADDON_SECRET"),
+		PublicURL:      strings.TrimRight(required("PUBLIC_URL"), "/"),
+		Section:        section,
+		AddonName:      get("ADDON_NAME", defaultName),
 	}
 
 	if cfg.PlexURL != "" {
 		parsed, err := url.Parse(cfg.PlexURL)
 		if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
 			fail("PLEX_URL must be an http or https URL")
+		}
+	}
+	if cfg.JellyfinURL != "" {
+		parsed, err := url.Parse(cfg.JellyfinURL)
+		if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+			fail("JELLYFIN_URL must be an http or https URL")
 		}
 	}
 	if cfg.PublicURL != "" {

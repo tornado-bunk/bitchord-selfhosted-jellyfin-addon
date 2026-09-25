@@ -67,6 +67,20 @@ func toTrackJSON(base string, track library.Track) trackJSON {
 	return out
 }
 
+func streamJSONFromInfo(base string, info library.StreamInfo) streamJSON {
+	return streamJSON{
+		URL:        base + "/file/" + info.ID,
+		Format:     info.Format,
+		Quality:    info.Quality,
+		Codec:      info.Codec,
+		Container:  info.Container,
+		Manifest:   "none",
+		SampleRate: info.SampleRate,
+		BitDepth:   info.BitDepth,
+		Bitrate:    info.Bitrate,
+	}
+}
+
 func toStreamJSON(base string, item plex.Track) (streamJSON, bool) {
 	media, part, ok := item.FirstPart()
 	if !ok {

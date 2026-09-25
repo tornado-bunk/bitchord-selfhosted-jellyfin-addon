@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/rairulyle/bitchord-selfhosted-addon/internal/config"
+	"github.com/rairulyle/bitchord-selfhosted-addon/internal/jellyfin"
 	"github.com/rairulyle/bitchord-selfhosted-addon/internal/library"
 	"github.com/rairulyle/bitchord-selfhosted-addon/internal/plex"
 	"github.com/rairulyle/bitchord-selfhosted-addon/internal/server"
@@ -50,8 +51,13 @@ func run(args []string, getenv func(string) string, stderr io.Writer) int {
 		return 1
 	}
 	log := newLogger(cfg.LogFormat, cfg.LogLevel, stderr)
-	log.Info("starting", "version", version, "plex", hostOf(cfg.PlexURL), "section", cmp.Or(cfg.Section, "all music"),
-		"refresh", cfg.RefreshInterval.String(), "public_url", cfg.PublicURL, "log_level", cfg.LogLevel.String())
+	serverHost := hostOf(cfg.PlexURL)
+	if cfg.Backend == config.BackendJellyfin {
+		serverHost = hostOf(cfg.JellyfinURL)
+	}
+	log.Info("starting", "version", version, "backend", string(cfg.Backend), "server", serverHost,
+		"section", cmp.Or(cfg.Section, "all music"), "refresh", cfg.RefreshInterval.String(),
+		"public_url", cfg.PublicURL, "log_level", cfg.LogLevel.String())
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)
 	defer stop()
 	if err := serve(ctx, cfg, log, func(net.Addr) {}); err != nil {
@@ -91,8 +97,24 @@ func healthcheck(url string) int {
 }
 
 func serve(ctx context.Context, cfg config.Config, log *slog.Logger, listening func(net.Addr)) error {
-	client := plex.New(plex.Options{BaseURL: cfg.PlexURL, Token: cfg.PlexToken})
-	lib := library.NewLibrary(client, cfg.Section, cfg.RefreshInterval, log)
+	var backend server.Backend
+	var source any
+	var plexClient *plex.Client
+	if cfg.Backend == config.BackendJellyfin {
+		jfClient := jellyfin.New(jellyfin.Options{
+			BaseURL: cfg.JellyfinURL,
+			Token:   cfg.JellyfinAPIKey,
+			User:    cfg.JellyfinUser,
+			UserID:  cfg.JellyfinUserID,
+		})
+		backend = jfClient
+		source = jfClient
+	} else {
+		plexClient = plex.New(plex.Options{BaseURL: cfg.PlexURL, Token: cfg.PlexToken})
+		source = plexClient
+	}
+
+	lib := library.NewLibrary(source, cfg.Section, cfg.RefreshInterval, log)
 	runCtx, stopRun := context.WithCancel(ctx)
 	runDone := make(chan struct{})
 	go func() {
@@ -111,7 +133,7 @@ func serve(ctx context.Context, cfg config.Config, log *slog.Logger, listening f
 	srv := &http.Server{
 		Handler: server.New(server.Options{
 			Secret: cfg.Secret, PublicURL: cfg.PublicURL, AddonName: cfg.AddonName, Version: version,
-			Library: lib, Plex: client, Log: log,
+			Library: lib, Plex: plexClient, Backend: backend, Log: log,
 		}),
 		// WriteTimeout stays unset: a stream lasts as long as the song.
 		ReadHeaderTimeout: 10 * time.Second,

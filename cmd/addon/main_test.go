@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/rairulyle/bitchord-selfhosted-addon/internal/config"
+	"github.com/rairulyle/bitchord-selfhosted-addon/internal/jellyfintest"
 	"github.com/rairulyle/bitchord-selfhosted-addon/internal/plextest"
 )
 
@@ -224,5 +225,60 @@ func TestNewLoggerFormats(t *testing.T) {
 	newLogger("text", slog.LevelWarn, &text).Info("quiet")
 	if strings.Contains(text.String(), "quiet") {
 		t.Error("level not applied")
+	}
+}
+
+func TestServeJellyfinAnswersOverHTTPAndShutsDownOnCancel(t *testing.T) {
+	fake := jellyfintest.New(t)
+	cfg := config.Config{
+		Backend:         config.BackendJellyfin,
+		JellyfinURL:     fake.URL,
+		JellyfinAPIKey:  jellyfintest.Token,
+		Secret:          "abcdefghijklmnop",
+		PublicURL:       "https://music.example.com",
+		AddonName:       "Jellyfin",
+		RefreshInterval: time.Hour,
+		Port:            0,
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	addrs := make(chan net.Addr, 1)
+	done := make(chan error, 1)
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	go func() { done <- serve(ctx, cfg, log, func(addr net.Addr) { addrs <- addr }) }()
+
+	var base string
+	select {
+	case addr := <-addrs:
+		base = "http://127.0.0.1:" + strconv.Itoa(addr.(*net.TCPAddr).Port)
+	case err := <-done:
+		t.Fatalf("serve returned early: %v", err)
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for healthcheck(base+"/health") != 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("never became healthy")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	res, err := http.Get(base + "/abcdefghijklmnop/search?q=new+religion")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(res.Body)
+	res.Body.Close()
+	if res.StatusCode != http.StatusOK || !strings.Contains(string(body), `"id":"jf-101"`) {
+		t.Fatalf("status %d, body %s", res.StatusCode, body)
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("serve: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("serve did not return after cancel")
 	}
 }

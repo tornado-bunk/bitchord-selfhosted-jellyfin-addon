@@ -21,6 +21,20 @@ type Track struct {
 	Thumb       string
 }
 
+type StreamInfo struct {
+	ID         string
+	Format     string
+	Quality    string
+	Codec      string
+	Container  string
+	SampleRate int
+	BitDepth   int
+	Bitrate    int
+	Label      string
+	PartKey    string
+	Thumb      string
+}
+
 type Index struct {
 	tracks      []Track
 	byID        map[string]int

@@ -5,9 +5,11 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 	"path"
+	"regexp"
 	"strings"
 	"time"
 
@@ -23,6 +25,17 @@ type Library interface {
 	Get(id string) (library.Track, bool)
 }
 
+type Backend interface {
+	Name() string
+	ManifestID() string
+	ManifestDescription() string
+	ValidID(id string) bool
+	StreamInfo(ctx context.Context, id string) (library.StreamInfo, error)
+	OpenFile(ctx context.Context, method, id, partKey string, header http.Header) (*http.Response, error)
+	OpenArt(ctx context.Context, id, thumb string) (*http.Response, error)
+	FormatError(err error) string
+}
+
 type Plex interface {
 	Track(ctx context.Context, id string) (plex.Track, error)
 	Open(ctx context.Context, method, path string, header http.Header) (*http.Response, error)
@@ -35,6 +48,7 @@ type Options struct {
 	Version   string
 	Library   Library
 	Plex      Plex
+	Backend   Backend
 	Log       *slog.Logger
 }
 
@@ -42,6 +56,16 @@ type server struct {
 	Options
 	secretSum     [sha256.Size]byte
 	lookupTimeout time.Duration
+}
+
+func (s *server) backend() Backend {
+	if s.Backend != nil {
+		return s.Backend
+	}
+	if s.Plex != nil {
+		return &plexAdapter{s: s}
+	}
+	return nil
 }
 
 func New(o Options) http.Handler { return newServer(o).handler() }
@@ -113,11 +137,25 @@ func (s *server) health(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *server) manifest(w http.ResponseWriter, _ *http.Request) {
+	b := s.backend()
+	id := "app.bitchord-selfhosted-addon.plex"
+	name := s.AddonName
+	desc := "Your Plex music library"
+	if b != nil {
+		id = b.ManifestID()
+		desc = b.ManifestDescription()
+		if name == "" {
+			name = b.Name()
+		}
+	}
+	if name == "" {
+		name = "Plex"
+	}
 	writeJSON(w, manifestJSON{
-		ID:          "app.bitchord-selfhosted-addon.plex",
-		Name:        s.AddonName,
+		ID:          id,
+		Name:        name,
 		Version:     s.Version,
-		Description: "Your Plex music library",
+		Description: desc,
 		Resources:   []string{"search", "stream"},
 		Types:       []string{"track"},
 		ContentType: "music",
@@ -207,4 +245,104 @@ func redact(p string) string {
 		return "/***" + rest[i:]
 	}
 	return "/***"
+}
+
+type plexAdapter struct {
+	s *server
+}
+
+func (p *plexAdapter) Name() string                { return "Plex" }
+func (p *plexAdapter) ManifestID() string          { return "app.bitchord-selfhosted-addon.plex" }
+func (p *plexAdapter) ManifestDescription() string { return "Your Plex music library" }
+func (p *plexAdapter) ValidID(id string) bool {
+	return regexp.MustCompile(`^[0-9]{1,20}$`).MatchString(id)
+}
+
+func (p *plexAdapter) FormatError(err error) string {
+	if errors.Is(err, plex.ErrUnauthorized) {
+		return "plex rejected the token, check PLEX_TOKEN"
+	}
+	return "plex request failed: " + err.Error()
+}
+
+func (p *plexAdapter) StreamInfo(ctx context.Context, id string) (library.StreamInfo, error) {
+	item, err := p.s.Plex.Track(ctx, id)
+	if err != nil {
+		return library.StreamInfo{}, err
+	}
+	media, part, ok := item.FirstPart()
+	if !ok {
+		return library.StreamInfo{}, plex.ErrNotFound
+	}
+	container := media.Container
+	if container == "" {
+		container = part.Container
+	}
+	format := plex.AudioFormat(media.AudioCodec, container)
+	stream, _ := part.AudioStream()
+	kbps := media.Bitrate
+	if kbps == 0 {
+		kbps = stream.Bitrate
+	}
+	name := item.Title
+	thumb := item.Thumb
+	if thumb == "" {
+		thumb = item.ParentThumb
+	}
+	if track, ok := library.FromPlex(item); ok {
+		name = label(track)
+		thumb = track.Thumb
+	}
+	return library.StreamInfo{
+		ID:         item.RatingKey,
+		Format:     format,
+		Quality:    quality(format, kbps, stream),
+		Codec:      format,
+		Container:  container,
+		SampleRate: stream.SamplingRate,
+		BitDepth:   stream.BitDepth,
+		Bitrate:    kbps * 1000,
+		Label:      name,
+		PartKey:    part.Key,
+		Thumb:      thumb,
+	}, nil
+}
+
+func (p *plexAdapter) OpenFile(ctx context.Context, method, id, partKey string, header http.Header) (*http.Response, error) {
+	if partKey == "" {
+		item, err := p.s.Plex.Track(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+		_, part, ok := item.FirstPart()
+		if !ok {
+			return nil, plex.ErrNotFound
+		}
+		partKey = part.Key
+	}
+	retryPath := partKey + "?download=1"
+	upstream, err := p.s.Plex.Open(ctx, method, partKey, header)
+	if err == nil && upstream.StatusCode == http.StatusInternalServerError && retryPath != "" {
+		upstream.Body.Close()
+		p.s.Log.Debug("plex refused direct play, retrying as a download", "id", id)
+		upstream, err = p.s.Plex.Open(ctx, method, retryPath, header)
+	}
+	return upstream, err
+}
+
+func (p *plexAdapter) OpenArt(ctx context.Context, id, thumb string) (*http.Response, error) {
+	if thumb == "" {
+		item, err := p.s.Plex.Track(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+		thumb = item.Thumb
+		if thumb == "" {
+			thumb = item.ParentThumb
+		}
+		if thumb == "" {
+			return nil, plex.ErrNotFound
+		}
+	}
+	return p.s.Plex.Open(ctx, http.MethodGet, plex.ArtPath(thumb), nil)
 }

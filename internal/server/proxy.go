@@ -5,7 +5,6 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/rairulyle/bitchord-selfhosted-addon/internal/library"
 	"github.com/rairulyle/bitchord-selfhosted-addon/internal/plex"
 )
 
@@ -27,13 +26,25 @@ func (s *server) file(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	started := time.Now()
-	sent := s.pipe(w, r, r.Method, track.partKey, header, "", track.partKey+"?download=1")
+	b := s.backend()
+	if b == nil {
+		w.WriteHeader(http.StatusBadGateway)
+		return
+	}
+	id := r.PathValue("id")
+	upstream, err := b.OpenFile(r.Context(), r.Method, id, track.partKey, header)
+	if err != nil {
+		s.logFailure(r, err)
+		w.WriteHeader(http.StatusBadGateway)
+		return
+	}
+	sent := s.transfer(w, r, upstream, "")
 	switch {
 	case sent.ended == "":
 	case r.Method == http.MethodHead:
-		s.Log.Debug("probe", "id", r.PathValue("id"), "track", track.label, "status", sent.status)
+		s.Log.Debug("probe", "id", id, "track", track.label, "status", sent.status)
 	default:
-		s.Log.Info("play", "id", r.PathValue("id"), "track", track.label, "range", r.Header.Get("Range"),
+		s.Log.Info("play", "id", id, "track", track.label, "range", r.Header.Get("Range"),
 			"status", sent.status, "bytes", sent.bytes, "ended", sent.ended, "took", time.Since(started).String())
 	}
 }
@@ -47,7 +58,19 @@ func (s *server) art(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(status)
 		return
 	}
-	s.pipe(w, r, http.MethodGet, plex.ArtPath(track.thumb), nil, "public, max-age=86400", "")
+	b := s.backend()
+	if b == nil {
+		w.WriteHeader(http.StatusBadGateway)
+		return
+	}
+	id := r.PathValue("id")
+	upstream, err := b.OpenArt(r.Context(), id, track.thumb)
+	if err != nil {
+		s.logFailure(r, err)
+		w.WriteHeader(http.StatusBadGateway)
+		return
+	}
+	s.transfer(w, r, upstream, "public, max-age=86400")
 }
 
 type resolved struct{ partKey, thumb, label string }
@@ -72,35 +95,27 @@ func (c *clientWriter) Write(p []byte) (int, error) {
 }
 
 func (s *server) resolve(r *http.Request) (resolved, int) {
-	id, ok := trackID(r)
+	id, ok := s.trackID(r)
 	if !ok {
 		return resolved{}, http.StatusNotFound
 	}
 	if track, found := s.Library.Get(id); found {
 		return resolved{track.PartKey, track.Thumb, label(track)}, http.StatusOK
 	}
-	item, status := s.lookup(r, id)
+	info, status := s.lookupStream(r, id)
 	if status != http.StatusOK {
 		return resolved{}, status
 	}
-	_, part, ok := item.FirstPart()
-	if !ok {
-		return resolved{}, http.StatusNotFound
-	}
-	thumb := item.Thumb
-	if thumb == "" {
-		thumb = item.ParentThumb
-	}
-	name := item.Title
-	if track, ok := library.FromPlex(item); ok {
-		name = label(track)
-	}
-	return resolved{part.Key, thumb, name}, http.StatusOK
+	return resolved{info.PartKey, info.Thumb, info.Label}, http.StatusOK
 }
 
 // Plex answers 500 to a direct-play request for a track it never finished
 // analysing (no media bitrate), yet serves the same part as a download.
 func (s *server) pipe(w http.ResponseWriter, r *http.Request, method, path string, header http.Header, cacheControl, retryPath string) sent {
+	if s.Plex == nil {
+		w.WriteHeader(http.StatusBadGateway)
+		return sent{}
+	}
 	upstream, err := s.Plex.Open(r.Context(), method, path, header)
 	if err == nil && upstream.StatusCode == http.StatusInternalServerError && retryPath != "" {
 		upstream.Body.Close()
@@ -112,6 +127,10 @@ func (s *server) pipe(w http.ResponseWriter, r *http.Request, method, path strin
 		w.WriteHeader(http.StatusBadGateway)
 		return sent{}
 	}
+	return s.transfer(w, r, upstream, cacheControl)
+}
+
+func (s *server) transfer(w http.ResponseWriter, r *http.Request, upstream *http.Response, cacheControl string) sent {
 	defer upstream.Body.Close()
 	switch upstream.StatusCode {
 	case http.StatusOK, http.StatusPartialContent, http.StatusRequestedRangeNotSatisfiable:
@@ -119,11 +138,11 @@ func (s *server) pipe(w http.ResponseWriter, r *http.Request, method, path strin
 		w.WriteHeader(http.StatusNotFound)
 		return sent{}
 	case http.StatusUnauthorized:
-		s.logPlexFailure(r, plex.ErrUnauthorized)
+		s.logFailure(r, plex.ErrUnauthorized)
 		w.WriteHeader(http.StatusBadGateway)
 		return sent{}
 	default:
-		s.Log.Error("plex answered the byte request badly", "status", upstream.StatusCode)
+		s.Log.Error("upstream answered the byte request badly", "status", upstream.StatusCode)
 		w.WriteHeader(http.StatusBadGateway)
 		return sent{}
 	}
@@ -141,6 +160,7 @@ func (s *server) pipe(w http.ResponseWriter, r *http.Request, method, path strin
 		return out
 	}
 	client := &clientWriter{Writer: w}
+	var err error
 	out.bytes, err = io.Copy(client, upstream.Body)
 	switch {
 	case err == nil:
